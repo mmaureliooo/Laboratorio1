@@ -1,1 +1,10 @@
 .vscode/
+
+# LAB 3 - binarios compilados
+LAB 3/banco
+LAB 3/usuario
+LAB 3/monitor
+
+# LAB 3 - ficheros generados en ejecución (no deben subirse al repo)
+LAB 3/cuentas.dat
+LAB 3/transacciones.log

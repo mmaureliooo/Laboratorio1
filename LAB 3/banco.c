@@ -30,7 +30,30 @@ static int leer_config(const char *ruta, Config *cfg) {
     //
     // Completar
     //
-    
+    char line[256];
+    while (fgets(line, sizeof(line), f)) {
+        /* Ignorar comentarios (#) y líneas vacías */
+        if (line[0] == '#' || line[0] == '\n') continue;
+        char key[128], val[128];
+        if (sscanf(line, "%127[^=]=%127s", key, val) != 2) continue;
+
+        /* Mapear cada clave al campo correspondiente de Config */
+        if      (strcmp(key, "PROXIMO_ID")            == 0) cfg->proximo_id           = atoi(val);
+        else if (strcmp(key, "LIM_RET_EUR")           == 0) cfg->lim_ret_eur          = atof(val);
+        else if (strcmp(key, "LIM_RET_USD")           == 0) cfg->lim_ret_usd          = atof(val);
+        else if (strcmp(key, "LIM_RET_GBP")           == 0) cfg->lim_ret_gbp          = atof(val);
+        else if (strcmp(key, "LIM_TRF_EUR")           == 0) cfg->lim_trf_eur          = atof(val);
+        else if (strcmp(key, "LIM_TRF_USD")           == 0) cfg->lim_trf_usd          = atof(val);
+        else if (strcmp(key, "LIM_TRF_GBP")           == 0) cfg->lim_trf_gbp          = atof(val);
+        else if (strcmp(key, "UMBRAL_RETIROS")        == 0) cfg->umbral_retiros        = atoi(val);
+        else if (strcmp(key, "UMBRAL_TRANSFERENCIAS") == 0) cfg->umbral_transferencias = atoi(val);
+        else if (strcmp(key, "NUM_HILOS")             == 0) cfg->num_hilos             = atoi(val);
+        else if (strcmp(key, "ARCHIVO_CUENTAS")       == 0) strncpy(cfg->archivo_cuentas, val, MAX_PATH-1);
+        else if (strcmp(key, "ARCHIVO_LOG")           == 0) strncpy(cfg->archivo_log,     val, MAX_PATH-1);
+        else if (strcmp(key, "CAMBIO_USD")            == 0) cfg->cambio_usd            = atof(val);
+        else if (strcmp(key, "CAMBIO_GBP")            == 0) cfg->cambio_gbp            = atof(val);
+    }
+
     fclose(f);
     return 0;
 }
@@ -77,10 +100,33 @@ static int crear_cuenta(Cuenta *nueva) {
     //
     // Completar
     //
+    /* Sección crítica: leer PROXIMO_ID, incrementarlo y guardarlo en config.txt */
+    if (sc == SEM_FAILED) { perror("sem_open SEM_CONFIG"); return -1; }
+    sem_wait(sc);
+    if (leer_config("config.txt", &g_cfg) < 0) {
+        sem_post(sc); sem_close(sc); return -1;
+    }
+    nueva->numero_cuenta = g_cfg.proximo_id;   /* asignar ID actual */
+    g_cfg.proximo_id++;                        /* preparar el siguiente */
+    guardar_proximo_id(g_cfg.proximo_id);      /* persistir en disco */
+    sem_post(sc);
+    sem_close(sc);
+
     sem_t *sa = sem_open(SEM_CUENTAS, 0);
     //
     // Completar
     //
+    /* Sección crítica: añadir la nueva cuenta al final del fichero binario */
+    if (sa == SEM_FAILED) { perror("sem_open SEM_CUENTAS"); return -1; }
+    sem_wait(sa);
+    FILE *f = fopen(g_cfg.archivo_cuentas, "ab");
+    if (!f) { sem_post(sa); sem_close(sa); return -1; }
+    fwrite(nueva, sizeof(Cuenta), 1, f);
+    fclose(f);
+    sem_post(sa);
+    sem_close(sa);
+
+    printf("Cuenta %d creada para '%s'.\n", nueva->numero_cuenta, nueva->titular);
     return nueva->numero_cuenta;
 }
 
@@ -90,6 +136,10 @@ static void escribir_log(const char *linea) {
     //
     // Completar
     //
+    /* Abrir en modo append para no sobreescribir entradas anteriores */
+    if (!f) return;
+    fprintf(f, "%s\n", linea);
+    fclose(f);
 }
 
 /* Buscar hijo por cuenta_id */
@@ -106,6 +156,22 @@ static void procesar_log(void) {
         //
         // Completar
         //
+        /* Convertir tipo_op a cadena legible para la línea de log */
+        const char *tipo_str;
+        switch (dl.tipo_op) {
+            case OP_DEPOSITO:      tipo_str = "Deposito";             break;
+            case OP_RETIRO:        tipo_str = "Retiro";               break;
+            case OP_TRANSFERENCIA: tipo_str = "Transferencia";        break;
+            case OP_MOVER_DIVISA:  tipo_str = "Movimiento de divisa"; break;
+            default:               tipo_str = "Operacion";            break;
+        }
+        char linea[512];
+        snprintf(linea, sizeof(linea),
+                 "[%s] %s en cuenta %d: %.2f %s - %s",
+                 dl.timestamp, tipo_str, dl.cuenta_id,
+                 dl.cantidad,  nombre_divisa(dl.divisa),
+                 dl.estado == 0 ? "OK" : "FALLIDO");
+        escribir_log(linea);
     }
 }
 
@@ -144,6 +210,30 @@ static pid_t lanzar_usuario(int cuenta_id, int *pipe_wr_out) {
     //
     // Completar
     //
+    if (pid < 0) {
+        perror("fork usuario");
+        close(pfd[0]); close(pfd[1]);
+        return -1;
+    }
+    if (pid == 0) {
+        /* Proceso hijo: cerrar extremo de escritura del pipe */
+        close(pfd[1]);
+        /* Cerrar descriptores de colas del padre (el hijo abrirá los suyos) */
+        if (g_mq_log     != (mqd_t)-1) mq_close(g_mq_log);
+        if (g_mq_alerta  != (mqd_t)-1) mq_close(g_mq_alerta);
+        if (g_mq_monitor != (mqd_t)-1) mq_close(g_mq_monitor);
+        /* Pasar cuenta_id y extremo de lectura del pipe como argumentos */
+        char s_cuenta[16], s_pipe[16];
+        snprintf(s_cuenta, sizeof(s_cuenta), "%d", cuenta_id);
+        snprintf(s_pipe,   sizeof(s_pipe),   "%d", pfd[0]);
+        char *args[] = { "./usuario", s_cuenta, s_pipe, NULL };
+        execv("./usuario", args);
+        perror("execv usuario");
+        _exit(1);
+    }
+    /* Proceso padre: conservar solo el extremo de escritura */
+    close(pfd[0]);
+    *pipe_wr_out = pfd[1];
     return pid;
 }
 
@@ -152,6 +242,20 @@ static void lanzar_monitor(void) {
     //
     // Completar
     //
+    pid_t pid = fork();
+    if (pid < 0) { perror("fork monitor"); return; }
+    if (pid == 0) {
+        /* Proceso hijo (monitor): cerrar las colas del padre */
+        if (g_mq_log     != (mqd_t)-1) mq_close(g_mq_log);
+        if (g_mq_alerta  != (mqd_t)-1) mq_close(g_mq_alerta);
+        if (g_mq_monitor != (mqd_t)-1) mq_close(g_mq_monitor);
+        char *args[] = { "./monitor", NULL };
+        execv("./monitor", args);
+        perror("execv monitor");
+        _exit(1);
+    }
+    /* Guardar PID del monitor para enviarle SIGTERM al cierre */
+    g_monitor_pid = pid;
 }
 
 

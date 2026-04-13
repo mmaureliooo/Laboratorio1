@@ -16,6 +16,18 @@ static void leer_config_monitor(void) {
    //
    // Completar
    //
+   /* Solo necesita los umbrales de detección de anomalías */
+   FILE *f = fopen("config.txt", "r");
+   if (!f) return;
+   char line[256];
+   while (fgets(line, sizeof(line), f)) {
+       if (line[0] == '#' || line[0] == '\n') continue;
+       char key[128], val[128];
+       if (sscanf(line, "%127[^=]=%127s", key, val) != 2) continue;
+       if      (strcmp(key, "UMBRAL_RETIROS")        == 0) g_umbral_retiros        = atoi(val);
+       else if (strcmp(key, "UMBRAL_TRANSFERENCIAS") == 0) g_umbral_transferencias = atoi(val);
+   }
+   fclose(f);
 }
 
 /*  Enviar alerta al padre  */
@@ -23,6 +35,13 @@ static void enviar_alerta(int cuenta_id, const char *tipo_alerta) {
     //
     // Completar
     //
+    DatosAlerta da;
+    memset(&da, 0, sizeof(da));
+    da.cuenta_id = cuenta_id;
+    /* El padre usará strstr sobre da.mensaje para clasificar la alerta */
+    snprintf(da.mensaje, sizeof(da.mensaje),
+             "%s en cuenta %d", tipo_alerta, cuenta_id);
+    mq_send(g_mq_alerta, (const char *)&da, sizeof(da), 0);
 }
 
 
@@ -54,6 +73,25 @@ static void analizar(const DatosMonitor *dm) {
     //
     // Completar
     //
+    /* Buscar o crear entrada de seguimiento para esta cuenta */
+    int idx = -1;
+    for (int i = 0; i < g_n_retiros; i++)
+        if (g_retiros[i].cuenta_id == dm->cuenta_origen) { idx = i; break; }
+    if (idx < 0 && g_n_retiros < MAX_CUENTAS_TRACK) {
+        idx = g_n_retiros++;
+        g_retiros[idx].cuenta_id            = dm->cuenta_origen;
+        g_retiros[idx].retiros_consecutivos = 0;
+        g_retiros[idx].ultimo_retiro        = 0.0f;
+    }
+    if (idx >= 0) {
+        g_retiros[idx].retiros_consecutivos++;
+        g_retiros[idx].ultimo_retiro = dm->cantidad;
+        /* Disparar alerta si se supera el umbral y reiniciar contador */
+        if (g_retiros[idx].retiros_consecutivos >= g_umbral_retiros) {
+            enviar_alerta(dm->cuenta_origen, ALERTA_RETIROS);
+            g_retiros[idx].retiros_consecutivos = 0;
+        }
+    }
     } else {
         for (int i = 0; i < g_n_retiros; i++)
             if (g_retiros[i].cuenta_id == dm->cuenta_origen) {
@@ -107,6 +145,18 @@ int main(void) {
         //
         // Completar
         //
+        /* Esperar hasta 500 ms a que llegue un mensaje de MQ_MONITOR */
+        int ret = poll(&pfd, 1, 500);
+        if (ret < 0) {
+            if (errno == EINTR) continue;  /* señal recibida, recomprobar g_salir */
+            break;
+        }
+        if (ret == 0) continue;  /* timeout, reintentar */
+
+        /* Hay datos disponibles: leer y analizar el mensaje */
+        DatosMonitor dm;
+        if (mq_receive(g_mq_monitor, (char *)&dm, sizeof(dm), NULL) > 0)
+            analizar(&dm);
     }
 
     mq_close(g_mq_monitor);

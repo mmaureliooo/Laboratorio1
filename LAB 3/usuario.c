@@ -13,6 +13,24 @@ static void leer_config_usuario(void) {
     //
     // Completar
     //
+    /* Si no existe config.txt, se usarán los valores por defecto de g_cfg */
+    if (!f) { perror("fopen config.txt"); return; }
+    char line[256];
+    while (fgets(line, sizeof(line), f)) {
+        if (line[0] == '#' || line[0] == '\n') continue;
+        char key[128], val[128];
+        if (sscanf(line, "%127[^=]=%127s", key, val) != 2) continue;
+        /* Solo se necesitan los límites, tipos de cambio y ruta de cuentas */
+        if      (strcmp(key, "LIM_RET_EUR")     == 0) g_cfg.lim_ret_eur          = atof(val);
+        else if (strcmp(key, "LIM_RET_USD")     == 0) g_cfg.lim_ret_usd          = atof(val);
+        else if (strcmp(key, "LIM_RET_GBP")     == 0) g_cfg.lim_ret_gbp          = atof(val);
+        else if (strcmp(key, "LIM_TRF_EUR")     == 0) g_cfg.lim_trf_eur          = atof(val);
+        else if (strcmp(key, "LIM_TRF_USD")     == 0) g_cfg.lim_trf_usd          = atof(val);
+        else if (strcmp(key, "LIM_TRF_GBP")     == 0) g_cfg.lim_trf_gbp          = atof(val);
+        else if (strcmp(key, "CAMBIO_USD")       == 0) g_cfg.cambio_usd           = atof(val);
+        else if (strcmp(key, "CAMBIO_GBP")       == 0) g_cfg.cambio_gbp           = atof(val);
+        else if (strcmp(key, "ARCHIVO_CUENTAS")  == 0) strncpy(g_cfg.archivo_cuentas, val, MAX_PATH-1);
+    }
     fclose(f);
 }
 
@@ -67,6 +85,13 @@ static void enviar_monitor(int cuenta_origen, int cuenta_destino,
     //
     // Completar
     //
+    /* Rellenar la estructura con los datos de la operación */
+    dm.cuenta_origen  = cuenta_origen;
+    dm.cuenta_destino = cuenta_destino;  /* 0 si no es transferencia */
+    dm.tipo_op        = tipo_op;
+    dm.cantidad       = cantidad;
+    dm.divisa         = divisa;
+    timestamp_ahora(dm.timestamp, sizeof(dm.timestamp));
     mq_send(g_mq_monitor, (const char *)&dm, sizeof(dm), 0);
 }
 
@@ -76,6 +101,15 @@ static void enviar_log(int tipo_op, float cantidad, int divisa, int estado) {
     //
     // Completar
     //
+    /* Rellenar y enviar el mensaje al padre (banco.c) para que lo registre */
+    dl.cuenta_id = g_cuenta_id;
+    dl.pid_hijo  = getpid();
+    dl.tipo_op   = tipo_op;
+    dl.cantidad  = cantidad;
+    dl.divisa    = divisa;
+    dl.estado    = estado;   /* 0 = éxito, 1 = fallo */
+    timestamp_ahora(dl.timestamp, sizeof(dl.timestamp));
+    mq_send(g_mq_log, (const char *)&dl, sizeof(dl), 0);
 }
 
 /*
@@ -95,18 +129,85 @@ typedef struct {
 
 /* Depósito  */
 static void *thread_deposito(void *arg) {
+    DatosOperacion *d = (DatosOperacion *)arg;
     sem_t *sem = abrir_sem_cuentas();
     //
     // Completar
     //
+    if (!sem) { free(d); return NULL; }
+
+    /* Sección crítica: leer cuenta, sumar importe y escribir de vuelta */
+    sem_wait(sem);
+    Cuenta c;
+    int estado = 1;  /* 1 = fallo por defecto */
+    if (leer_cuenta(d->cuenta_id, &c) == 0) {
+        switch (d->divisa_origen) {
+            case DIV_EUR: c.saldo_eur += d->cantidad; break;
+            case DIV_USD: c.saldo_usd += d->cantidad; break;
+            default:      c.saldo_gbp += d->cantidad; break;
+        }
+        escribir_cuenta(&c);
+        printf("Deposito OK: +%.2f %s\n", d->cantidad, nombre_divisa(d->divisa_origen));
+        estado = 0;
+    }
+    sem_post(sem);
+    sem_close(sem);
+
+    /* Notificar al padre y al monitor */
+    enviar_log(OP_DEPOSITO, d->cantidad, d->divisa_origen, estado);
+    enviar_monitor(d->cuenta_id, 0, OP_DEPOSITO, d->cantidad, d->divisa_origen);
+    free(d);
+    return NULL;
 }
 
 /* Retiro */
 static void *thread_retiro(void *arg) {
-
+    DatosOperacion *d = (DatosOperacion *)arg;
     //
     // Completar
     //
+    sem_t *sem = abrir_sem_cuentas();
+    if (!sem) { free(d); return NULL; }
+
+    /* Obtener el límite de retiro según la divisa elegida */
+    float limite;
+    switch (d->divisa_origen) {
+        case DIV_EUR: limite = g_cfg.lim_ret_eur; break;
+        case DIV_USD: limite = g_cfg.lim_ret_usd; break;
+        default:      limite = g_cfg.lim_ret_gbp; break;
+    }
+
+    int estado = 1;
+    sem_wait(sem);
+    Cuenta c;
+    if (leer_cuenta(d->cuenta_id, &c) == 0) {
+        /* Puntero al saldo correcto para no repetir el switch */
+        float *saldo;
+        switch (d->divisa_origen) {
+            case DIV_EUR: saldo = &c.saldo_eur; break;
+            case DIV_USD: saldo = &c.saldo_usd; break;
+            default:      saldo = &c.saldo_gbp; break;
+        }
+        if (d->cantidad > *saldo) {
+            printf("Saldo insuficiente (%.2f %s disponibles).\n",
+                   *saldo, nombre_divisa(d->divisa_origen));
+        } else if (d->cantidad > limite) {
+            printf("Supera el limite de retiro (%.2f %s).\n",
+                   limite, nombre_divisa(d->divisa_origen));
+        } else {
+            *saldo -= d->cantidad;
+            escribir_cuenta(&c);
+            printf("Retiro OK: -%.2f %s\n", d->cantidad, nombre_divisa(d->divisa_origen));
+            estado = 0;
+        }
+    }
+    sem_post(sem);
+    sem_close(sem);
+
+    enviar_log(OP_RETIRO, d->cantidad, d->divisa_origen, estado);
+    enviar_monitor(d->cuenta_id, 0, OP_RETIRO, d->cantidad, d->divisa_origen);
+    free(d);
+    return NULL;
 }
 
 /*
@@ -114,13 +215,116 @@ E2C940E3C540D7C9C4C5D540D8E4C540C3D6D5E2C5D9E5C5E240C5D340C5E2D8E4C5D3C5E3D640C4
 */
 /* Transferencia */
 static void *thread_transferencia(void *arg) {
-    
-   
+    //
+    // Completar
+    //
+    DatosOperacion *d = (DatosOperacion *)arg;
+    sem_t *sem = abrir_sem_cuentas();
+    if (!sem) { free(d); return NULL; }
+
+    /* Límite de transferencia según divisa */
+    float limite;
+    switch (d->divisa_origen) {
+        case DIV_EUR: limite = g_cfg.lim_trf_eur; break;
+        case DIV_USD: limite = g_cfg.lim_trf_usd; break;
+        default:      limite = g_cfg.lim_trf_gbp; break;
+    }
+
+    int estado = 1;
+    sem_wait(sem);
+    Cuenta origen, destino;
+    if (leer_cuenta(d->cuenta_id,      &origen)  != 0 ||
+        leer_cuenta(d->cuenta_destino, &destino) != 0) {
+        printf("Cuenta destino %d no encontrada.\n", d->cuenta_destino);
+    } else {
+        /* Punteros al saldo afectado en cada cuenta (misma divisa) */
+        float *s_orig, *s_dest;
+        switch (d->divisa_origen) {
+            case DIV_EUR: s_orig = &origen.saldo_eur; s_dest = &destino.saldo_eur; break;
+            case DIV_USD: s_orig = &origen.saldo_usd; s_dest = &destino.saldo_usd; break;
+            default:      s_orig = &origen.saldo_gbp; s_dest = &destino.saldo_gbp; break;
+        }
+        if (d->cantidad > *s_orig) {
+            printf("Saldo insuficiente para la transferencia.\n");
+        } else if (d->cantidad > limite) {
+            printf("Supera el limite de transferencia (%.2f %s).\n",
+                   limite, nombre_divisa(d->divisa_origen));
+        } else {
+            *s_orig -= d->cantidad;
+            *s_dest += d->cantidad;
+            /* Escribir ambas cuentas dentro de la sección crítica */
+            escribir_cuenta(&origen);
+            escribir_cuenta(&destino);
+            printf("Transferencia OK: %.2f %s -> cuenta %d\n",
+                   d->cantidad, nombre_divisa(d->divisa_origen), d->cuenta_destino);
+            estado = 0;
+        }
+    }
+    sem_post(sem);
+    sem_close(sem);
+
+    enviar_log(OP_TRANSFERENCIA, d->cantidad, d->divisa_origen, estado);
+    enviar_monitor(d->cuenta_id, d->cuenta_destino,
+                   OP_TRANSFERENCIA, d->cantidad, d->divisa_origen);
+    free(d);
+    return NULL;
 }
 
 /* Mover divisas */
 static void *thread_mover_divisa(void *arg) {
-    
+    //
+    // Completar
+    //
+    DatosOperacion *d = (DatosOperacion *)arg;
+    sem_t *sem = abrir_sem_cuentas();
+    if (!sem) { free(d); return NULL; }
+
+    int estado = 1;
+    sem_wait(sem);
+    Cuenta c;
+    if (leer_cuenta(d->cuenta_id, &c) == 0) {
+        /* Puntero al saldo origen */
+        float *s_orig;
+        switch (d->divisa_origen) {
+            case DIV_EUR: s_orig = &c.saldo_eur; break;
+            case DIV_USD: s_orig = &c.saldo_usd; break;
+            default:      s_orig = &c.saldo_gbp; break;
+        }
+        if (d->cantidad > *s_orig) {
+            printf("Saldo insuficiente para la conversion.\n");
+        } else {
+            /* Convertir origen → EUR → destino */
+            float en_eur;
+            switch (d->divisa_origen) {
+                case DIV_EUR: en_eur = d->cantidad;                        break;
+                case DIV_USD: en_eur = d->cantidad / g_cfg.cambio_usd;    break;
+                default:      en_eur = d->cantidad / g_cfg.cambio_gbp;    break;
+            }
+            float en_dest;
+            switch (d->divisa_destino) {
+                case DIV_EUR: en_dest = en_eur;                            break;
+                case DIV_USD: en_dest = en_eur * g_cfg.cambio_usd;        break;
+                default:      en_dest = en_eur * g_cfg.cambio_gbp;        break;
+            }
+            *s_orig -= d->cantidad;
+            switch (d->divisa_destino) {
+                case DIV_EUR: c.saldo_eur += en_dest; break;
+                case DIV_USD: c.saldo_usd += en_dest; break;
+                default:      c.saldo_gbp += en_dest; break;
+            }
+            escribir_cuenta(&c);
+            printf("Conversion OK: %.2f %s -> %.2f %s\n",
+                   d->cantidad, nombre_divisa(d->divisa_origen),
+                   en_dest,     nombre_divisa(d->divisa_destino));
+            estado = 0;
+        }
+    }
+    sem_post(sem);
+    sem_close(sem);
+
+    enviar_log(OP_MOVER_DIVISA, d->cantidad, d->divisa_origen, estado);
+    free(d);
+    return NULL;
 }
 
 /* Lanzar thread */
@@ -132,7 +336,33 @@ static void lanzar_operacion(void *(*fn)(void*), DatosOperacion *d) {
 
 /* Consultar saldos */
 static void consultar_saldos(void) {
-    
+    //
+    // Completar
+    //
+    sem_t *sem = abrir_sem_cuentas();
+    if (!sem) return;
+    sem_wait(sem);
+    Cuenta c;
+    int ok = leer_cuenta(g_cuenta_id, &c);
+    sem_post(sem);
+    sem_close(sem);
+
+    if (ok != 0) { printf("Error al leer la cuenta.\n"); return; }
+
+    /* Total equivalente en EUR usando los tipos de cambio de config.txt */
+    float total_eur = c.saldo_eur
+                    + c.saldo_usd / g_cfg.cambio_usd
+                    + c.saldo_gbp / g_cfg.cambio_gbp;
+
+    printf("\n+-----------------------------+\n");
+    printf("|  Saldos cuenta %-12d|\n", g_cuenta_id);
+    printf("|-----------------------------|\n");
+    printf("| EUR: %22.2f |\n", c.saldo_eur);
+    printf("| USD: %22.2f |\n", c.saldo_usd);
+    printf("| GBP: %22.2f |\n", c.saldo_gbp);
+    printf("|-----------------------------|\n");
+    printf("| Total (EUR): %14.2f |\n", total_eur);
+    printf("+-----------------------------+\n");
 }
 
 /* Pedir divisa */
