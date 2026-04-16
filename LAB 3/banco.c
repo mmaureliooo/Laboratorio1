@@ -35,9 +35,12 @@ static int leer_config(const char *ruta, Config *cfg) {
         /* Ignorar comentarios (#) y líneas vacías */
         if (line[0] == '#' || line[0] == '\n') continue;
         char key[128], val[128];
+        /* %127[^=] captura todo hasta el '=' como clave; %127s captura el valor hasta el primer espacio o fin de línea */
+        //tiene que ser 2 porque es clave y valor
         if (sscanf(line, "%127[^=]=%127s", key, val) != 2) continue;
 
-        /* Mapear cada clave al campo correspondiente de Config */
+        /* cada clave y valor a su correspondiente dato de la estructura Config */
+        //usamos atoi/atof por simplicidad; si no es un valor int/float devuelve 0 y ya.
         if      (strcmp(key, "PROXIMO_ID")            == 0) cfg->proximo_id           = atoi(val);
         else if (strcmp(key, "LIM_RET_EUR")           == 0) cfg->lim_ret_eur          = atof(val);
         else if (strcmp(key, "LIM_RET_USD")           == 0) cfg->lim_ret_usd          = atof(val);
@@ -66,7 +69,6 @@ static void guardar_proximo_id(int nuevo_id) {
     size_t n = fread(contenido, 1, sizeof(contenido)-1, f);
     contenido[n] = '\0';
     fclose(f);
-
     char *p = strstr(contenido, "PROXIMO_ID=");
     if (!p) return;
     size_t antes     = (size_t)(p - contenido);
@@ -76,7 +78,6 @@ static void guardar_proximo_id(int nuevo_id) {
     snprintf(nuevo, sizeof(nuevo), "%.*sPROXIMO_ID=%d%s",
              (int)antes, contenido, nuevo_id,
              fin_linea ? fin_linea : "");
-
     f = fopen("config.txt", "w");
     if (!f) return;
     fputs(nuevo, f);
@@ -100,29 +101,31 @@ static int crear_cuenta(Cuenta *nueva) {
     //
     // Completar
     //
-    /* Sección crítica: leer PROXIMO_ID, incrementarlo y guardarlo en config.txt */
+
+    // Sección crítica: leer PROXIMO_ID, incrementarlo y guardarlo en config.txt
     if (sc == SEM_FAILED) { perror("sem_open SEM_CONFIG"); return -1; }
-    sem_wait(sc);
+    sem_wait(sc);//restar al sem
+    // Re-leemos config dentro del semáforo para obtener el valor más reciente:
+    // otro proceso pudo haber incrementado PROXIMO_ID entre nuestro arranque y ahora
     if (leer_config("config.txt", &g_cfg) < 0) {
-        sem_post(sc); sem_close(sc); return -1;
+        sem_post(sc); sem_close(sc); return -1; //cerrar semaforo local si falla
     }
-    nueva->numero_cuenta = g_cfg.proximo_id;   /* asignar ID actual */
-    g_cfg.proximo_id++;                        /* preparar el siguiente */
-    guardar_proximo_id(g_cfg.proximo_id);      /* persistir en disco */
+    nueva->numero_cuenta = g_cfg.proximo_id;   // asignar ID actual
+    g_cfg.proximo_id++;                        // preparar el siguiente
+    guardar_proximo_id(g_cfg.proximo_id);      // persistir en disco antes de liberar
     sem_post(sc);
-    sem_close(sc);
+    sem_close(sc); //cerrar semaforo local
 
     sem_t *sa = sem_open(SEM_CUENTAS, 0);
-    //
-    // Completar
-    //
-    /* Sección crítica: añadir la nueva cuenta al final del fichero binario */
-    if (sa == SEM_FAILED) { perror("sem_open SEM_CUENTAS"); return -1; }
-    sem_wait(sa);
+
+    // Sección crítica: añadir la nueva cuenta al final del fichero binario
+    if (sa == SEM_FAILED) { perror("sem_open SEM_CUENTAS"); return -1; } //salir si falla
+    sem_wait(sa);//restamos al sem
+    // en ab el puntero siempre va al final, seguro aunque otro proceso tenga el fichero abierto
     FILE *f = fopen(g_cfg.archivo_cuentas, "ab");
-    if (!f) { sem_post(sa); sem_close(sa); return -1; }
-    fwrite(nueva, sizeof(Cuenta), 1, f);
-    fclose(f);
+    if (!f) { sem_post(sa); sem_close(sa); return -1; } // si falla cerramos y retornamos
+    fwrite(nueva, sizeof(Cuenta), 1, f); // reescribimos la nueva cuenta
+    fclose(f);//cerramos fichero
     sem_post(sa);
     sem_close(sa);
 
@@ -136,10 +139,11 @@ static void escribir_log(const char *linea) {
     //
     // Completar
     //
-    /* Abrir en modo append para no sobreescribir entradas anteriores */
+
+    // Abrir en modo append para no sobreescribir entradas anteriores
     if (!f) return;
-    fprintf(f, "%s\n", linea);
-    fclose(f);
+    fprintf(f, "%s\n", linea); //escribir la nueva linea de log como apendice
+    fclose(f);//cerrar
 }
 
 /* Buscar hijo por cuenta_id */
@@ -156,7 +160,8 @@ static void procesar_log(void) {
         //
         // Completar
         //
-        /* Convertir tipo_op a cadena legible para la línea de log */
+
+        // Convertir tipo_op a cadena legible para la línea de log
         const char *tipo_str;
         switch (dl.tipo_op) {
             case OP_DEPOSITO:      tipo_str = "Deposito";             break;
@@ -165,6 +170,7 @@ static void procesar_log(void) {
             case OP_MOVER_DIVISA:  tipo_str = "Movimiento de divisa"; break;
             default:               tipo_str = "Operacion";            break;
         }
+        // Formato final en linea: [YYYY-MM-DD HH:MM:SS] Operacion en cuenta ID: cantidad DIV - OK|FALLIDO
         char linea[512];
         snprintf(linea, sizeof(linea),
                  "[%s] %s en cuenta %d: %.2f %s - %s",
@@ -210,31 +216,31 @@ static pid_t lanzar_usuario(int cuenta_id, int *pipe_wr_out) {
     //
     // Completar
     //
-    if (pid < 0) {
+    if (pid < 0) { //por si acaso falla
         perror("fork usuario");
         close(pfd[0]); close(pfd[1]);
         return -1;
     }
     if (pid == 0) {
-        /* Proceso hijo: cerrar extremo de escritura del pipe */
+        // Proceso hijo: cerrar extremo de escritura del pipe
         close(pfd[1]);
-        /* Cerrar descriptores de colas del padre (el hijo abrirá los suyos) */
+        // Cerrar colas del padre (el hijo abrirá los suyos)
         if (g_mq_log     != (mqd_t)-1) mq_close(g_mq_log);
         if (g_mq_alerta  != (mqd_t)-1) mq_close(g_mq_alerta);
         if (g_mq_monitor != (mqd_t)-1) mq_close(g_mq_monitor);
-        /* Pasar cuenta_id y extremo de lectura del pipe como argumentos */
+        // Pasar cuenta_id y extremo de lectura del pipe como argumentos
         char s_cuenta[16], s_pipe[16];
         snprintf(s_cuenta, sizeof(s_cuenta), "%d", cuenta_id);
         snprintf(s_pipe,   sizeof(s_pipe),   "%d", pfd[0]);
         char *args[] = { "./usuario", s_cuenta, s_pipe, NULL };
         execv("./usuario", args);
         perror("execv usuario");
-        _exit(1);
+        _exit(1); //que no hace flush
     }
-    /* Proceso padre: conservar solo el extremo de escritura */
+    // Proceso padre: conservar solo el extremo de escritura, si no hijo nunca eof
     close(pfd[0]);
-    *pipe_wr_out = pfd[1];
-    return pid;
+    *pipe_wr_out = pfd[1]; //devolver el pipe de este usuario al padre por si se necesita bloquear
+    return pid;  //devolver pid
 }
 
 /* Lanzar proceso monitor */
@@ -245,16 +251,16 @@ static void lanzar_monitor(void) {
     pid_t pid = fork();
     if (pid < 0) { perror("fork monitor"); return; }
     if (pid == 0) {
-        /* Proceso hijo (monitor): cerrar las colas del padre */
+        // Proceso hijo (monitor): cerrar las colas del padre
         if (g_mq_log     != (mqd_t)-1) mq_close(g_mq_log);
         if (g_mq_alerta  != (mqd_t)-1) mq_close(g_mq_alerta);
         if (g_mq_monitor != (mqd_t)-1) mq_close(g_mq_monitor);
         char *args[] = { "./monitor", NULL };
         execv("./monitor", args);
         perror("execv monitor");
-        _exit(1);
+        _exit(1);// que no hace flush
     }
-    /* Guardar PID del monitor para enviarle SIGTERM al cierre */
+    // Guardar PID del monitor para enviarle SIGTERM al cierre
     g_monitor_pid = pid;
 }
 
@@ -279,7 +285,7 @@ int main(void) {
 
     /* Crear las tres colas POSIX en modo no bloqueante para poder
      * drenarlas con mq_receive en un bucle sin quedarse colgado    */
-    struct mq_attr attr;
+    struct mq_attr attr; //struct de atributos en modo no block
     memset(&attr, 0, sizeof(attr));
     attr.mq_maxmsg = MQ_MAXMSG;
     attr.mq_flags  = O_NONBLOCK;
@@ -364,7 +370,7 @@ int main(void) {
         pfd_ses[1].fd = g_mq_alerta; pfd_ses[1].events = POLLIN;
 
         while (!g_salir) {
-            poll(pfd_ses, 2, 200);
+            poll(pfd_ses, 2, 200); //timeout cada 200ms
 
             if (pfd_ses[0].revents & POLLIN) procesar_log();
             if (pfd_ses[1].revents & POLLIN) procesar_alertas();
